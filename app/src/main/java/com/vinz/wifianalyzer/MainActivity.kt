@@ -24,9 +24,6 @@ import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
 import android.widget.Toast
-import java.io.File
-import java.net.DatagramPacket
-import java.net.DatagramSocket
 import java.net.InetAddress
 import java.net.InetSocketAddress
 import java.net.Socket
@@ -37,11 +34,20 @@ import java.util.concurrent.atomic.AtomicInteger
 
 private class Probe(val ip: String, val ms: Long, val ports: List<Int>)
 
+private class Info {
+    @Volatile var host = ""
+    @Volatile var mdns = ""
+    @Volatile var nb = ""
+    @Volatile var upnp = ""
+    @Volatile var model = ""
+    @Volatile var title = ""
+}
+
 class MainActivity : Activity() {
 
     data class Dev(
-        val ip: String, val mac: String, val host: String, val tag: String,
-        val ports: String, val ms: Long, val kind: String, val upnp: String
+        val ip: String, val mac: String, val name: String, val host: String, val tag: String,
+        val ports: String, val ms: Long, val kind: String, val model: String, val vendor: String
     )
 
     lateinit var wifi: WifiManager
@@ -59,17 +65,15 @@ class MainActivity : Activity() {
     private var lastScan = 0L
     private var devices: List<Dev> = emptyList()
     private var devStatus = "Tekan tombol untuk scan perangkat yang terhubung di WiFi ini."
+    private var macNote = ""
+    private var rootMsg = ""
+    private var devStatusView: TextView? = null
+
+    private var saved: List<NetTools.Saved> = emptyList()
+    private var pwStatus = ""
+    private var pwLoading = false
 
     private val PORTS = intArrayOf(80, 443, 53, 22, 23, 139, 445, 554, 7000, 8008, 8009, 8080, 9100, 5555, 62078)
-
-    private val OUI = mapOf(
-        "B8:27:EB" to "Raspberry Pi",
-        "DC:A6:32" to "Raspberry Pi",
-        "E4:5F:01" to "Raspberry Pi",
-        "00:50:56" to "VMware",
-        "08:00:27" to "VirtualBox",
-        "3C:5A:B4" to "Google"
-    )
 
     private val ticker = object : Runnable {
         override fun run() {
@@ -184,6 +188,10 @@ class MainActivity : Activity() {
         try { startActivity(Intent(Settings.ACTION_LOCATION_SOURCE_SETTINGS)) } catch (e: Exception) { }
     }
 
+    private fun openWifiSettings() {
+        try { startActivity(Intent(Settings.ACTION_WIFI_SETTINGS)) } catch (e: Exception) { }
+    }
+
     // ---------- tabs ----------
 
     fun refresh(i: Int) {
@@ -268,17 +276,19 @@ class MainActivity : Activity() {
         }
         val match = safeScan().firstOrNull { it.BSSID == info.bssid }
         val mac = info.macAddress ?: "-"
+        val pw = saved.firstOrNull { it.ssid == ssid }
 
-        content.addView(card("Koneksi", listOf(
-            "BSSID" to (info.bssid ?: "-"),
-            "Band" to band(freq),
-            "Channel" to "${chan(freq)}  ($freq MHz)",
-            "Lebar channel" to (if (match != null) width(match.channelWidth) else "-"),
-            "Link speed" to "${info.linkSpeed} Mbps",
-            "Standar" to std,
-            "Keamanan" to (if (match != null) sec(match.capabilities) else "-"),
-            "MAC HP ini" to (if (mac.startsWith("02:00:00")) "Disembunyikan Android (privasi)" else mac)
-        )))
+        val rows = ArrayList<Pair<String, String>>()
+        rows.add("BSSID" to (info.bssid ?: "-"))
+        rows.add("Band" to band(freq))
+        rows.add("Channel" to "${chan(freq)}  ($freq MHz)")
+        rows.add("Lebar channel" to (if (match != null) width(match.channelWidth) else "-"))
+        rows.add("Link speed" to "${info.linkSpeed} Mbps")
+        rows.add("Standar" to std)
+        rows.add("Keamanan" to (if (match != null) sec(match.capabilities) else "-"))
+        if (pw != null) rows.add("Password" to (if (pw.pass.isEmpty()) "(terbuka)" else pw.pass))
+        rows.add("MAC HP ini" to (if (mac.startsWith("02:00:00")) "Disembunyikan Android (privasi)" else mac))
+        content.addView(card("Koneksi", rows))
 
         val cidr = Integer.bitCount(d.netmask)
         content.addView(card("Alamat IP", listOf(
@@ -292,7 +302,7 @@ class MainActivity : Activity() {
         )))
     }
 
-    // ---------- tab 1: scan jaringan ----------
+    // ---------- tab 1: scan jaringan + password tersimpan ----------
 
     private fun startScan(silent: Boolean) {
         lastScan = System.currentTimeMillis()
@@ -307,8 +317,41 @@ class MainActivity : Activity() {
         ui.postDelayed({ if (tab == 1) showTab(1) }, 3500)
     }
 
+    private fun loadSaved() {
+        if (pwLoading) return
+        pwLoading = true
+        pwStatus = "Meminta akses Root... (tekan Izinkan/Grant di pop-up root)"
+        showTab(1)
+        Thread {
+            val r = NetTools.savedWifi()
+            ui.post {
+                pwLoading = false
+                saved = r.first
+                pwStatus = r.second
+                if (tab == 1) showTab(1)
+            }
+        }.start()
+    }
+
+    private fun pwCard() {
+        if (saved.isEmpty()) {
+            content.addView(card("Password WiFi tersimpan", listOf(
+                "Info" to (if (pwStatus.isEmpty())
+                    "Tampilkan password WiFi yang pernah tersimpan di HP ini, termasuk yang sedang tidak tersambung. Butuh akses Root."
+                else pwStatus)
+            )))
+            content.addView(button(if (pwLoading) "Membaca..." else "🔑  Tampilkan Password Tersimpan (Root)") { loadSaved() })
+            content.addView(button("Tanpa Root: buka Pengaturan WiFi (Bagikan QR)") { openWifiSettings() })
+        } else {
+            content.addView(card("Password tersimpan (${saved.size})", saved.map {
+                Pair(it.ssid, if (it.pass.isEmpty()) "(terbuka)" else it.pass)
+            }, cGood))
+        }
+    }
+
     private fun renderScan() {
         content.addView(button("⟳  Scan Ulang") { startScan(false) })
+        pwCard()
         permCards()
         if (!hasLoc()) return
 
@@ -343,67 +386,72 @@ class MainActivity : Activity() {
             val name = if (r.SSID.isNullOrEmpty()) "(Tersembunyi)" else r.SSID
             val qq = quality(r.level)
             val isMe = r.BSSID == connected
-            val c = card(
-                (if (isMe) "● " else "") + name,
-                listOf(
-                    "Sinyal" to "${bars(r.level)}  ${r.level} dBm  (${qq.first})",
-                    "Band / Ch" to "${band(r.frequency)}  •  Ch ${chan(r.frequency)}  •  ${width(r.channelWidth)}",
-                    "Keamanan" to sec(r.capabilities),
-                    "BSSID" to r.BSSID
-                ),
-                if (isMe) cGood else qq.second
-            )
-            content.addView(c)
+            val rows = ArrayList<Pair<String, String>>()
+            rows.add("Sinyal" to "${bars(r.level)}  ${r.level} dBm  (${qq.first})")
+            rows.add("Band / Ch" to "${band(r.frequency)}  •  Ch ${chan(r.frequency)}  •  ${width(r.channelWidth)}")
+            rows.add("Keamanan" to sec(r.capabilities))
+            val pw = saved.firstOrNull { it.ssid == r.SSID }
+            if (pw != null) rows.add("Password" to (if (pw.pass.isEmpty()) "(terbuka)" else pw.pass))
+            rows.add("BSSID" to r.BSSID)
+            content.addView(card((if (isMe) "● " else "") + name, rows, if (isMe) cGood else qq.second))
         }
     }
 
     // ---------- tab 2: perangkat ----------
 
-    private var devStatusView: TextView? = null
+    private fun requestRoot() {
+        rootMsg = "Meminta akses Root... (tekan Izinkan/Grant di pop-up root)"
+        showTab(2)
+        Thread {
+            val ok = NetTools.hasRoot(true)
+            ui.post {
+                rootMsg = if (ok) "Root: AKTIF ✔ (MAC akan dibaca via root saat scan)"
+                else "Root: tidak tersedia / ditolak"
+                if (tab == 2) showTab(2)
+            }
+        }.start()
+    }
 
     private fun renderDevices() {
         content.addView(button(if (scanning) "Scanning..." else "🔍  Scan Perangkat") { scanDevices() })
+        content.addView(button("Izinkan Root (untuk baca MAC)") { requestRoot() })
+        if (rootMsg.isNotEmpty()) {
+            content.addView(tv(rootMsg, 12f, if (NetTools.rootGranted()) cGood else cWarn).apply { setPadding(dp(4), 0, dp(4), dp(6)) })
+        }
         val st = tv(devStatus, 13f, cSub)
-        st.setPadding(dp(4), 0, dp(4), dp(10))
+        st.setPadding(dp(4), 0, dp(4), dp(8))
         devStatusView = st
         content.addView(st)
+        if (macNote.isNotEmpty()) {
+            content.addView(tv(macNote, 12f, cSub).apply { setPadding(dp(4), 0, dp(4), dp(10)) })
+        }
 
         for (d in devices) {
             val rows = ArrayList<Pair<String, String>>()
+            rows.add("Nama" to (if (d.name.isEmpty()) "-" else d.name))
             rows.add("Jenis" to d.kind)
-            rows.add("Hostname" to (if (d.host.isEmpty()) "-" else d.host))
-            if (d.upnp.isNotEmpty()) rows.add("UPnP" to d.upnp)
-            rows.add("MAC" to (if (d.mac == "-") "Diblokir Android 10+" else d.mac))
-            if (d.mac != "-") rows.add("Tipe MAC" to macInfo(d.mac))
+            if (d.model.isNotEmpty()) rows.add("Model" to d.model)
+            if (d.host.isNotEmpty() && d.host != d.name) rows.add("Hostname" to d.host)
+            rows.add("MAC" to (if (d.mac == "-") macMissing() else d.mac))
+            if (d.mac != "-") {
+                rows.add("Vendor" to when {
+                    NetTools.isRandomMac(d.mac) -> "MAC acak/privat (HP modern)"
+                    d.vendor.isNotEmpty() -> d.vendor
+                    else -> "Mencari..."
+                })
+            }
             rows.add("Port terbuka" to d.ports)
             rows.add("Respon" to (if (d.ms < 0) "-" else "${d.ms} ms"))
             content.addView(card(d.ip + (if (d.tag.isNotEmpty()) "   ${d.tag}" else ""), rows))
         }
         content.addView(tv(
-            "Catatan: Android 10+ memblokir pembacaan MAC/ARP, jadi jenis perangkat ditebak dari port & UPnP. Perangkat yang memblokir semua koneksi bisa tidak terdeteksi.",
+            "Catatan: nama diambil dari mDNS, NetBIOS, UPnP, judul web, dan DNS. Perangkat yang menyembunyikan diri (kebanyakan HP Android) tidak punya nama yang bisa dibaca dari jaringan.",
             11f, cSub
         ).apply { setPadding(dp(4), dp(6), dp(4), dp(20)) })
     }
 
-    private fun macInfo(mac: String): String {
-        if (mac.length < 17) return "-"
-        val first = mac.substring(0, 2).toIntOrNull(16) ?: return "-"
-        if ((first and 2) != 0) return "MAC acak/privat (HP modern)"
-        return OUI[mac.substring(0, 8)] ?: "Vendor tidak dikenal"
-    }
-
-    private fun readArp(): Map<String, String> {
-        val m = HashMap<String, String>()
-        try {
-            File("/proc/net/arp").forEachLine { l ->
-                val p = l.trim().split(Regex("\\s+"))
-                if (p.size >= 4 && p[0] != "IP" && p[3] != "00:00:00:00:00:00" && p[2] != "0x0") {
-                    m[p[0]] = p[3].uppercase()
-                }
-            }
-        } catch (e: Exception) { }
-        return m
-    }
+    private fun macMissing(): String =
+        if (Build.VERSION.SDK_INT >= 30) "Diblokir Android 11+ (butuh Root)" else "Tidak terbaca (coba izinkan Root)"
 
     private fun probe(ip: String): Probe? {
         var up = false
@@ -436,36 +484,18 @@ class MainActivity : Activity() {
         return if (up) Probe(ip, ms, open) else null
     }
 
-    private fun ssdp(): Map<String, String> {
-        val out = HashMap<String, String>()
-        val s = DatagramSocket()
-        try {
-            s.soTimeout = 400
-            val msg = "M-SEARCH * HTTP/1.1\r\nHOST: 239.255.255.250:1900\r\nMAN: \"ssdp:discover\"\r\nMX: 1\r\nST: ssdp:all\r\n\r\n".toByteArray()
-            s.send(DatagramPacket(msg, msg.size, InetAddress.getByName("239.255.255.250"), 1900))
-            val end = System.currentTimeMillis() + 2500
-            val buf = ByteArray(2048)
-            val rx = Regex("(?im)^SERVER:\\s*(.+)$")
-            while (System.currentTimeMillis() < end) {
-                try {
-                    val p = DatagramPacket(buf, buf.size)
-                    s.receive(p)
-                    val txt = String(p.data, 0, p.length)
-                    val ip = p.address.hostAddress
-                    val server = rx.find(txt)?.groupValues?.get(1)?.trim() ?: ""
-                    if (ip != null && server.isNotEmpty() && !out.containsKey(ip)) out[ip] = server
-                } catch (e: Exception) { }
-            }
-        } catch (e: Exception) {
-        } finally {
-            s.close()
-        }
-        return out
-    }
-
-    private fun guessKind(ports: List<Int>, gw: Boolean, me: Boolean): String = when {
+    private fun guessKind(ports: List<Int>, gw: Boolean, me: Boolean, hint: String): String = when {
         me -> Build.MANUFACTURER + " " + Build.MODEL + " (HP ini)"
         gw -> "Router / Gateway"
+        hint.contains("iphone") -> "iPhone (Apple)"
+        hint.contains("ipad") -> "iPad (Apple)"
+        hint.contains("macbook") || hint.contains("imac") -> "Mac (Apple)"
+        hint.contains("android") || hint.contains("galaxy") || hint.contains("redmi") ||
+            hint.contains("xiaomi") || hint.contains("oppo") || hint.contains("vivo") ||
+            hint.contains("realme") || hint.contains("infinix") || hint.contains("tecno") -> "HP Android"
+        hint.contains("desktop-") || hint.contains("laptop-") || hint.contains("windows") -> "PC / Laptop Windows"
+        hint.contains("chromecast") -> "Chromecast"
+        hint.contains("bravia") || hint.contains("roku") || hint.contains("smarttv") || hint.contains("smart tv") -> "Smart TV"
         62078 in ports -> "iPhone / iPad (Apple)"
         7000 in ports -> "Apple TV / AirPlay"
         8009 in ports || 8008 in ports -> "Chromecast / Google TV"
@@ -488,6 +518,7 @@ class MainActivity : Activity() {
         }
         scanning = true
         devices = emptyList()
+        macNote = ""
         devStatus = "Mulai scan..."
         showTab(2)
 
@@ -497,10 +528,14 @@ class MainActivity : Activity() {
         val myStr = ipStr(myIp)
         val gwStr = ipStr(gwIp)
         val prefix = myStr.substringBeforeLast(".") + "."
+        val myName = try {
+            Settings.Global.getString(contentResolver, "device_name") ?: Build.MODEL
+        } catch (e: Exception) { Build.MODEL }
 
         Thread {
             val pool = Executors.newFixedThreadPool(64)
             val done = AtomicInteger(0)
+            var finalList: List<Dev> = emptyList()
             try {
                 val tasks = (1..254).map { i ->
                     Callable<Probe?> {
@@ -522,47 +557,76 @@ class MainActivity : Activity() {
                     try { val p = f.get(); if (p != null) found[p.ip] = p } catch (e: Exception) { }
                 }
 
-                val arp = readArp()
+                val arpRes = NetTools.arp()
+                val arp = arpRes.first
                 for ((ip, _) in arp) {
                     if (ip.startsWith(prefix) && !found.containsKey(ip)) found[ip] = Probe(ip, -1L, emptyList())
                 }
 
                 ui.post { devStatus = "Mencari nama perangkat..."; devStatusView?.text = devStatus }
 
-                val nameTasks = found.keys.map { ip ->
-                    Callable<Pair<String, String>> {
-                        val h = try { InetAddress.getByName(ip).canonicalHostName } catch (e: Exception) { ip }
-                        Pair(ip, if (h == ip) "" else h)
+                val ss = NetTools.ssdp()
+                val infos = HashMap<String, Info>()
+                for (ip in found.keys) infos[ip] = Info()
+
+                val nameTasks = found.keys.filter { it != myStr }.map { ip ->
+                    Callable<Boolean> {
+                        val inf = infos[ip]!!
+                        val p = found[ip]
+                        inf.mdns = NetTools.mdnsName(ip)
+                        inf.nb = NetTools.netbiosName(ip)
+                        val s = ss[ip]
+                        if (s != null && s.second.isNotEmpty()) {
+                            val u = NetTools.upnpInfo(s.second, ip)
+                            inf.upnp = u.first
+                            inf.model = u.second
+                        }
+                        if (p != null) {
+                            val hp = if (80 in p.ports) 80 else if (8080 in p.ports) 8080 else 0
+                            if (hp != 0) inf.title = NetTools.httpTitle(ip, hp)
+                        }
+                        inf.host = try {
+                            val h = InetAddress.getByName(ip).canonicalHostName
+                            if (h == ip) "" else h
+                        } catch (e: Exception) { "" }
+                        true
                     }
                 }
-                val names = HashMap<String, String>()
-                for (f in pool.invokeAll(nameTasks, 8, TimeUnit.SECONDS)) {
-                    try { val r = f.get(); names[r.first] = r.second } catch (e: Exception) { }
-                }
+                pool.invokeAll(nameTasks, 15, TimeUnit.SECONDS)
 
-                val upnp = ssdp()
-
-                val list = found.values
+                finalList = found.values
                     .sortedBy { it.ip.substringAfterLast(".").toIntOrNull() ?: 0 }
                     .map { p ->
                         val isMe = p.ip == myStr
                         val isGw = p.ip == gwStr
                         val tag = if (isMe) "(HP ini)" else if (isGw) "(Router)" else ""
+                        val inf = infos[p.ip]!!
+                        val name = if (isMe) myName else
+                            listOf(inf.upnp, inf.mdns, inf.nb, inf.host, inf.title).firstOrNull { it.isNotEmpty() } ?: ""
+                        val hint = (name + " " + inf.model + " " + inf.host).lowercase()
                         Dev(
                             p.ip,
                             if (isMe) "-" else (arp[p.ip] ?: "-"),
-                            if (isMe) Build.MODEL else (names[p.ip] ?: ""),
+                            name,
+                            if (isMe) "" else inf.host,
                             tag,
                             if (p.ports.isEmpty()) "-" else p.ports.joinToString(", "),
                             p.ms,
-                            guessKind(p.ports, isGw, isMe),
-                            upnp[p.ip] ?: ""
+                            guessKind(p.ports, isGw, isMe, hint),
+                            inf.model,
+                            ""
                         )
                     }
+                val note = if (arp.isNotEmpty()) "MAC dibaca via ${arpRes.second}."
+                else if (Build.VERSION.SDK_INT >= 29)
+                    "MAC tidak terbaca. Android 10+ memblokir tabel ARP untuk app biasa dan tidak ada izin biasa untuk membukanya. Satu-satunya jalan: tekan \"Izinkan Root\" (HP harus di-root)."
+                else "MAC tidak terbaca di HP ini."
+                val fl = finalList
                 ui.post {
                     scanning = false
-                    devices = list
-                    devStatus = "Selesai: ${list.size} perangkat ditemukan."
+                    devices = fl
+                    macNote = note
+                    devStatus = "Selesai: ${fl.size} perangkat ditemukan."
                     if (tab == 2) showTab(2)
                 }
             } catch (e: Exception) {
@@ -574,6 +638,26 @@ class MainActivity : Activity() {
             } finally {
                 pool.shutdownNow()
             }
+
+            // cari vendor dari MAC (online, pelan: 1 request / detik)
+            try {
+                val withMac = finalList.filter { it.mac != "-" && !NetTools.isRandomMac(it.mac) }.take(12)
+                if (withMac.isNotEmpty()) {
+                    val vmap = HashMap<String, String>()
+                    for (dv in withMac) {
+                        val v = NetTools.vendor(dv.mac)
+                        vmap[dv.ip] = if (v.isEmpty()) "Tidak dikenal" else v
+                        Thread.sleep(1100)
+                    }
+                    ui.post {
+                        devices = devices.map { x ->
+                            val v = vmap[x.ip]
+                            if (v != null) x.copy(vendor = v) else x
+                        }
+                        if (tab == 2) showTab(2)
+                    }
+                }
+            } catch (e: Exception) { }
         }.start()
     }
 }
